@@ -19,7 +19,8 @@ def main():
         lr_control=3e-4,
         batch_size=64,
         n_epochs=10,
-        device=device
+        device=device,
+        use_wandb=False
     )
     
     # Start training

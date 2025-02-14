@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel, GPT2Config
+from transformers import GPT2LMHeadModel, GPT2Config, GPT2Tokenizer
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 
 class RobotControlNetwork(nn.Module):
@@ -71,6 +71,10 @@ class RobotBrain(nn.Module):
         )
         self.llm = GPT2LMHeadModel(self.llm_config)
         
+        # Initialize tokenizer
+        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
         # Add LoRA adapters for efficient fine-tuning
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -88,24 +92,33 @@ class RobotBrain(nn.Module):
     
     def forward(self, vision, task_description, robot_state):
         # Generate plan using LLM with chain-of-thought prompting
+        # Handle batched inputs by taking the first item in the batch
+        x = robot_state[0, 0].item()
+        y = robot_state[0, 1].item()
+        orientation = robot_state[0, 2].item()
+        
         prompt = f"""Task: {task_description}
-Current state: The robot is at position ({robot_state[0]:.1f}, {robot_state[1]:.1f}) with orientation {robot_state[2]:.1f}.
+Current state: The robot is at position ({x:.1f}, {y:.1f}) with orientation {orientation:.1f}.
 Let's think about this step by step:
 1) First, I should..."""
         
         # Generate chain of thought reasoning
         with torch.no_grad():
-            inputs = self.llm.tokenizer(prompt, return_tensors="pt").to(self.device)
-            outputs = self.llm.generate(
+            # Tokenize input
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            
+            # Generate text
+            generated_ids = self.llm.generate(
                 **inputs,
                 max_length=200,
                 num_return_sequences=1,
-                pad_token_id=self.llm.config.eos_token_id
+                pad_token_id=self.tokenizer.eos_token_id
             )
-            reasoning = self.llm.tokenizer.decode(outputs[0])
+            reasoning = self.tokenizer.decode(generated_ids[0])
             
-            # Get the last hidden state as command embedding
-            command_embedding = self.llm(outputs).last_hidden_state[:, -1]
+            # Get command embedding from the last hidden state
+            model_outputs = self.llm(**inputs, output_hidden_states=True)
+            command_embedding = model_outputs.hidden_states[-1][:, -1]
         
         # Generate robot actions using the control network
         actions = self.control_network(vision, command_embedding, robot_state)

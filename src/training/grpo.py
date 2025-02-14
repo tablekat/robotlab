@@ -22,11 +22,13 @@ class GRPO:
         c2=0.01,
         batch_size=64,
         n_epochs=10,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        use_wandb=False
     ):
         self.robot_brain = robot_brain
         self.env = env
         self.device = device
+        self.use_wandb = use_wandb
         
         # Separate optimizers for LLM and control network
         self.optimizer_llm = torch.optim.AdamW(
@@ -47,18 +49,19 @@ class GRPO:
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         
-        # Initialize logging with wandb
-        wandb.init(project="robot-brain", config={
-            "lr_llm": lr_llm,
-            "lr_control": lr_control,
-            "gamma": gamma,
-            "gae_lambda": gae_lambda,
-            "clip_epsilon": clip_epsilon,
-            "c1": c1,
-            "c2": c2,
-            "batch_size": batch_size,
-            "n_epochs": n_epochs
-        })
+        # Initialize logging with wandb if enabled
+        if self.use_wandb:
+            wandb.init(project="robot-brain", config={
+                "lr_llm": lr_llm,
+                "lr_control": lr_control,
+                "gamma": gamma,
+                "gae_lambda": gae_lambda,
+                "clip_epsilon": clip_epsilon,
+                "c1": c1,
+                "c2": c2,
+                "batch_size": batch_size,
+                "n_epochs": n_epochs
+            })
     
     def compute_gae(self, rewards, values, dones):
         """Compute Generalized Advantage Estimation."""
@@ -84,16 +87,14 @@ class GRPO:
         actions = []
         rewards = []
         dones = []
-        values = []
-        log_probs = []
         reasonings = []
         
         state, _ = self.env.reset()
         done = False
         
         for _ in range(n_steps):
-            # Convert state to tensor
-            vision = torch.FloatTensor(state['vision']).unsqueeze(0).to(self.device)
+            # Convert state to tensor and fix vision shape from [H, W, C] to [C, H, W]
+            vision = torch.FloatTensor(state['vision']).permute(2, 0, 1).unsqueeze(0).to(self.device)
             robot_state = torch.FloatTensor(state['robot_state']).unsqueeze(0).to(self.device)
             
             # Get action from policy
@@ -192,13 +193,14 @@ class GRPO:
                 self.optimizer_llm.step()
                 self.optimizer_control.step()
                 
-                # Log metrics
-                wandb.log({
-                    "policy_loss": policy_loss.item(),
-                    "value_loss": value_loss.item(),
-                    "llm_loss": llm_loss.item(),
-                    "total_loss": total_loss.item()
-                })
+                # Log metrics if wandb is enabled
+                if self.use_wandb:
+                    wandb.log({
+                        "policy_loss": policy_loss.item(),
+                        "value_loss": value_loss.item(),
+                        "llm_loss": llm_loss.item(),
+                        "total_loss": total_loss.item()
+                    })
     
     def train(self, n_iterations=1000):
         """Train the robot brain for n iterations."""
@@ -213,4 +215,5 @@ class GRPO:
                     'optimizer_control_state_dict': self.optimizer_control.state_dict(),
                 }, f'checkpoint_{i+1}.pt')
         
-        wandb.finish() 
+        if self.use_wandb:
+            wandb.finish() 

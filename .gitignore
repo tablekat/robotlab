@@ -3,3 +3,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pt
+*.pt.tar
+*.pt.tar.gz
+*.pt.tar.bz2
+*.pt.tar.xz
+*.pt.tar.lzma
+*.pt.tar.lzma.gz

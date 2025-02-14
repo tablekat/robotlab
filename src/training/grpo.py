@@ -7,21 +7,17 @@ from tqdm import tqdm
 import wandb
 
 class GRPO:
-    """Generalized Proximal Policy Optimization for training the robot brain."""
+    """Simplified Proximal Policy Optimization for training the robot control network."""
     
     def __init__(
         self,
         robot_brain,
         env,
-        lr_llm=1e-5,
-        lr_control=3e-4,
+        lr=3e-4,
         gamma=0.99,
-        gae_lambda=0.95,
         clip_epsilon=0.2,
-        c1=1.0,
-        c2=0.01,
-        batch_size=64,
-        n_epochs=10,
+        batch_size=32,
+        n_epochs=5,
         device='cuda' if torch.cuda.is_available() else 'cpu',
         use_wandb=False
     ):
@@ -30,64 +26,37 @@ class GRPO:
         self.device = device
         self.use_wandb = use_wandb
         
-        # Separate optimizers for LLM and control network
-        self.optimizer_llm = torch.optim.AdamW(
-            robot_brain.get_llm_parameters(),
-            lr=lr_llm
-        )
-        self.optimizer_control = torch.optim.AdamW(
-            robot_brain.get_control_parameters(),
-            lr=lr_control
+        # Single optimizer for control network
+        self.optimizer = torch.optim.Adam(
+            robot_brain.get_parameters(),
+            lr=lr
         )
         
         # Training parameters
         self.gamma = gamma
-        self.gae_lambda = gae_lambda
         self.clip_epsilon = clip_epsilon
-        self.c1 = c1
-        self.c2 = c2
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         
         # Initialize logging with wandb if enabled
         if self.use_wandb:
             wandb.init(project="robot-brain", config={
-                "lr_llm": lr_llm,
-                "lr_control": lr_control,
+                "lr": lr,
                 "gamma": gamma,
-                "gae_lambda": gae_lambda,
                 "clip_epsilon": clip_epsilon,
-                "c1": c1,
-                "c2": c2,
                 "batch_size": batch_size,
                 "n_epochs": n_epochs
             })
     
-    def compute_gae(self, rewards, values, dones):
-        """Compute Generalized Advantage Estimation."""
-        advantages = torch.zeros_like(rewards)
-        last_gae = 0
-        
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_value = 0
-            else:
-                next_value = values[t + 1]
-            
-            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
-            advantages[t] = last_gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * last_gae
-        
-        returns = advantages + values
-        return advantages, returns
-    
-    def collect_rollout(self, n_steps=1000):
+    def collect_rollout(self, n_steps=100):  # Reduced from 1000 to 100 steps
         """Collect experience using current policy."""
         # Storage for rollout data
-        states = []
+        vision_states = []
+        robot_states = []
         actions = []
+        log_probs = []
         rewards = []
         dones = []
-        reasonings = []
         
         state, _ = self.env.reset()
         done = False
@@ -99,22 +68,24 @@ class GRPO:
             
             # Get action from policy
             with torch.no_grad():
-                action, reasoning = self.robot_brain(
+                dist, action, _ = self.robot_brain(
                     vision,
                     "Navigate to the nearest target while avoiding obstacles",
                     robot_state
                 )
+                log_prob = dist.log_prob(action).sum(-1)  # Sum log probs across action dimensions
                 action = action.cpu().numpy()[0]
             
             # Take action in environment
             next_state, reward, done, _, _ = self.env.step(action)
             
             # Store experience
-            states.append(state)
+            vision_states.append(state['vision'])
+            robot_states.append(state['robot_state'])
             actions.append(action)
+            log_probs.append(log_prob.cpu().numpy())
             rewards.append(reward)
             dones.append(done)
-            reasonings.append(reasoning)
             
             if done:
                 state, _ = self.env.reset()
@@ -122,97 +93,88 @@ class GRPO:
             else:
                 state = next_state
         
-        return (
-            torch.FloatTensor(states).to(self.device),
-            torch.FloatTensor(actions).to(self.device),
-            torch.FloatTensor(rewards).to(self.device),
-            torch.FloatTensor(dones).to(self.device),
-            reasonings
-        )
+        # Convert to tensors
+        vision_states = torch.FloatTensor(vision_states).permute(0, 3, 1, 2).to(self.device)  # [B, C, H, W]
+        robot_states = torch.FloatTensor(robot_states).to(self.device)
+        actions = torch.FloatTensor(actions).to(self.device)
+        log_probs = torch.FloatTensor(log_probs).to(self.device)
+        rewards = torch.FloatTensor(rewards).to(self.device)
+        dones = torch.FloatTensor(dones).to(self.device)
+        
+        # Compute returns
+        returns = torch.zeros_like(rewards)
+        running_return = 0
+        for t in reversed(range(len(rewards))):
+            running_return = rewards[t] + self.gamma * running_return * (1 - dones[t])
+            returns[t] = running_return
+        
+        # Create state dictionary
+        states = {
+            'vision': vision_states,
+            'robot_state': robot_states
+        }
+        
+        return states, actions, log_probs, returns
     
     def train_iteration(self):
-        """Run one iteration of GRPO training."""
+        """Run one iteration of PPO training."""
         # Collect rollout data
-        states, actions, rewards, dones, reasonings = self.collect_rollout()
-        
-        # Compute advantages and returns
-        with torch.no_grad():
-            values = self.robot_brain.get_value(states)
-        advantages, returns = self.compute_gae(rewards, values, dones)
-        
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        states, actions, old_log_probs, returns = self.collect_rollout()
         
         # Training loop
         for _ in range(self.n_epochs):
             # Generate random permutation for minibatches
-            indices = torch.randperm(len(states))
+            indices = torch.randperm(len(states['vision']))
             
-            for start in range(0, len(states), self.batch_size):
+            for start in range(0, len(states['vision']), self.batch_size):
                 end = start + self.batch_size
                 batch_indices = indices[start:end]
                 
                 # Get minibatch
-                state_batch = states[batch_indices]
+                state_batch = {
+                    'vision': states['vision'][batch_indices],
+                    'robot_state': states['robot_state'][batch_indices]
+                }
                 action_batch = actions[batch_indices]
-                advantage_batch = advantages[batch_indices]
+                old_log_prob_batch = old_log_probs[batch_indices]
                 return_batch = returns[batch_indices]
-                old_value_batch = values[batch_indices]
                 
                 # Forward pass
-                new_actions, new_reasonings = self.robot_brain(
+                dist, _, _ = self.robot_brain(
                     state_batch['vision'],
                     "Navigate to the nearest target while avoiding obstacles",
                     state_batch['robot_state']
                 )
                 
-                # Compute losses
-                # Policy loss (clipped objective)
-                ratio = torch.exp(new_actions.log_prob(action_batch) - actions.log_prob(action_batch))
-                surr1 = ratio * advantage_batch
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage_batch
+                # Compute policy loss
+                log_prob = dist.log_prob(action_batch).sum(-1)
+                ratio = torch.exp(log_prob - old_log_prob_batch)
+                surr1 = ratio * return_batch
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * return_batch
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                # Value loss
-                value_pred = self.robot_brain.get_value(state_batch)
-                value_loss = F.mse_loss(value_pred, return_batch)
-                
-                # LLM loss (based on reasoning quality - simplified)
-                llm_loss = F.mse_loss(
-                    self.robot_brain.llm(new_reasonings).logits,
-                    self.robot_brain.llm(reasonings).logits.detach()
-                )
-                
-                # Combined loss
-                total_loss = policy_loss + self.c1 * value_loss + self.c2 * llm_loss
-                
                 # Optimization step
-                self.optimizer_llm.zero_grad()
-                self.optimizer_control.zero_grad()
-                total_loss.backward()
-                self.optimizer_llm.step()
-                self.optimizer_control.step()
+                self.optimizer.zero_grad()
+                policy_loss.backward()
+                self.optimizer.step()
                 
                 # Log metrics if wandb is enabled
                 if self.use_wandb:
                     wandb.log({
                         "policy_loss": policy_loss.item(),
-                        "value_loss": value_loss.item(),
-                        "llm_loss": llm_loss.item(),
-                        "total_loss": total_loss.item()
+                        "mean_return": return_batch.mean().item()
                     })
     
-    def train(self, n_iterations=1000):
+    def train(self, n_iterations=100):  # Reduced from 1000 to 100 iterations
         """Train the robot brain for n iterations."""
         for i in tqdm(range(n_iterations)):
             self.train_iteration()
             
-            # Save checkpoint every 100 iterations
-            if (i + 1) % 100 == 0:
+            # Save checkpoint every 10 iterations
+            if (i + 1) % 10 == 0:  # Changed from 100 to 10
                 torch.save({
                     'robot_brain_state_dict': self.robot_brain.state_dict(),
-                    'optimizer_llm_state_dict': self.optimizer_llm.state_dict(),
-                    'optimizer_control_state_dict': self.optimizer_control.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
                 }, f'checkpoint_{i+1}.pt')
         
         if self.use_wandb:
